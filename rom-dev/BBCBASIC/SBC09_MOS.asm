@@ -10,6 +10,11 @@ FC_RTS_CTS   EQU 2
 
 FLOW_CONTROL EQU FC_RTS_CTS
 
+UART_6850    EQU 0
+UART_68681   EQU 1
+
+UART_TYPE    EQU UART_6850
+
 ;; *************************************************************
 ;; Memory
 ;; *************************************************************
@@ -29,7 +34,6 @@ ZP_END       EQU  $00fF
 
 BRKV         EQU  $0202
 
-
 ;; Rx Buffer is 0x7e00-0x7eFF - Set in middle as B,X addressing is used (B is signed)
 RX_BUFFER    EQU  $7E80
 
@@ -38,11 +42,103 @@ TX_BUFFER    EQU  $7F80
 
 UART         EQU  $A000
 
+   IF UART_TYPE == UART_6850
+
+UART_CTRL    EQU  UART
+UART_STATUS  EQU  UART
+UART_TXDATA  EQU  UART+1
+UART_RXDATA  EQU  UART+1
+
+UART_RXINT   EQU  $01
+UART_TXINT   EQU  $02
+
+UART_ENABLE_TXINT MACRO
+      LDB  #$B5
+      STB  UART_CTRL
+      ENDM
+
+UART_DISABLE_TXINT MACRO
+      LDA  #$95
+      STA  UART_CTRL
+      ENDM
+
+UART_INIT MACRO
+   IF FLOW_CONTROL == FC_RTS_CTS
+      JSR  UPDATE_UART_CTRL
+   ELSE
+      UART_DISABLE_TXINT
+   ENDIF
+      ENDM
+
+   ELSE
+
+UART_MRA     EQU UART+0x0
+UART_SRA     EQU UART+0x1
+UART_CSRA    EQU UART+0x1
+UART_CRA     EQU UART+0x2
+UART_THRA    EQU UART+0x3
+UART_RHRA    EQU UART+0x3
+UART_ACR     EQU UART+0x4
+UART_IMR     EQU UART+0x5
+UART_CTU     EQU UART+0x6
+UART_CTL     EQU UART+0x7
+UART_MRB     EQU UART+0x8
+UART_SRB     EQU UART+0x9
+UART_CSRB    EQU UART+0x9
+UART_CRB     EQU UART+0xa
+UART_THRB    EQU UART+0xb
+UART_RHRB    EQU UART+0xb
+UART_IVR1    EQU UART+0xc
+UART_OPCR    EQU UART+0xd
+UART_OPRSET  EQU UART+0xe ; write
+UART_STARTCT EQU UART+0xe ; read command
+UART_OPRCLR  EQU UART+0xf ; write
+UART_STOPCT  EQU UART+0xf ; read command
+
+UART_STATUS  EQU  UART_SRA
+UART_TXDATA  EQU  UART_THRA
+UART_RXDATA  EQU  UART_RHRA
+
+UART_RXINT   EQU  $01
+UART_TXINT   EQU  $04
+
+UART_ENABLE_TXINT MACRO
+      LDB  #$03
+      STB  UART_IMR
+      ENDM
+
+UART_DISABLE_TXINT MACRO
+      LDA  #$02
+      STA  UART_IMR
+      ENDM
+
+
+UART_INIT MACRO
+      LDA  #%00010011    ; NO PARITY, 8 BITS/CHAR - MR1A,B
+      STA  UART_MRA
+      LDA  #%00010111    ; CTS ENABLE TX, 1.000 STOP BITS - MR2A,B
+      STA  UART_MRA
+      LDA  #%00000101    ; ENABLE TX AND RX
+      STA  UART_CRA
+      LDA  #%11101110    ; External 16x -> 115200 baud
+      STA  UART_CSRA
+   IF FLOW_CONTROL == FC_RTS_CTS
+      JSR  UPDATE_UART_CTRL
+   ELSE
+      UART_DISABLE_TXINT
+   ENDIF
+      ENDM
+
+   ENDIF
+
 ;; *************************************************************
 ;; UART
 ;; *************************************************************
 
    IF FLOW_CONTROL == FC_RTS_CTS
+
+   IF UART_TYPE == UART_6850
+
 ;; If Rx occupancy > 75% then
 ;;     UART_CTRL = D5 (B6:5=10; RTS high; TxIRQ disabled)
 ;; else if Tx occupancy > 0% then
@@ -62,16 +158,52 @@ UPDATE_UART_CTRL
       LDB  #$B5
       BRA  2F
 1     LDB  #$95
-2     STB  UART
+2     STB  UART_CTRL
+      RTS
+
+   ELSE
+
+;; If Rx occupancy > 75% then
+;;     UART_OPRCLR = 1    ; de-assert RTS
+;; else
+;;     UART_OPRSET = 1    ; assert RTS
+;;
+;; if Tx occupancy > 0% then
+;;     UART_IMR = $01
+;; else
+;;     UART_IMR = $00
+;;
+
+UPDATE_UART_CTRL
+      LDB  <ZP_RX_TAIL    ; Determine whethe RTS needs to be raised
+      SUBB <ZP_RX_HEAD    ; Tail - Head gives the receive buffer occupancy
+      CMPB #$C0           ; C=0 if occupancy >=75%
+      LDB  #$01
+      BCC  1F
+      STB  UART_OPRSET     ; assert RTS
+      BRA  2F
+1     STB  UART_OPRCLR     ; de-assert RTS
+2
+      LDB  <ZP_TX_HEAD    ; Is the Tx buffer empty?
+      CMPB <ZP_TX_TAIL
+      BEQ  1F
+      LDB  #$03           ; Not-empty, so enable TxInt (leaving RxInt enabled)
+      BRA  2F
+1     LDB  #$02           ; Empty, so disable TxInt (leaving RxInt enabled)
+2     STB  UART_IMR
       RTS
    ENDIF
 
+   ENDIF
+
+
+
 IRQ_HANDLER
-      LDA  UART            ; Read UART status register
-      BITA #$01            ; Test bit 0 (RxFull)
+      LDA  UART_STATUS     ; Read UART status register
+      BITA #UART_RXINT     ; Test bit 0 (RxFull)
 
       BEQ  IRQ_TX          ; no, then go on to check for a transmit interrupt
-      LDA  UART+1          ; Read UART Rx Data (and clear interrupt)
+      LDA  UART_RXDATA     ; Read UART Rx Data (and clear interrupt)
       CMPA #$1B            ; Test for escape
       BNE  IRQ_NOESC
       LDB  #$80            ; Set the escape flag
@@ -86,8 +218,8 @@ IRQ_NOESC
       STB  <ZP_RX_TAIL     ; no, then save the incremented tail pointer
 
 IRQ_TX
-      LDA  UART            ; Read UART status register
-      BITA #$02            ; Test bit 0 (TxEmpty)
+      LDA  UART_STATUS     ; Read UART status register
+      BITA #UART_TXINT     ; Test bit 0 (TxEmpty)
       BEQ  IRQ_EXIT        ; Not empty, so exit
 
    ;; Simple implementation of XON/XOFF to prevent receive buffer overflow
@@ -114,7 +246,7 @@ IRQ_TX_CHAR
       LDA  B,X
 
 SEND_A
-      STA  UART+1
+      STA  UART_TXDATA
 
 IRQ_EXIT
 
@@ -124,8 +256,7 @@ IRQ_TX_EMPTY
    ELSE
       RTI
 IRQ_TX_EMPTY
-      LDA  #$95
-      STA  UART
+      UART_DISABLE_TXINT
    ENDIF
 
 ILL_HANDLER
@@ -333,8 +464,7 @@ OSWRCH
    IF FLOW_CONTROL == FC_RTS_CTS
       JSR   UPDATE_UART_CTRL
    ELSE
-      LDB   #$B5        ; Enable Tx interrupts to make sure buffer is serviced
-      STB   UART
+      UART_ENABLE_TXINT ; Enable Tx interrupts to make sure buffer is serviced
    ENDIF
       PULS  B,X
       RTS
@@ -379,12 +509,7 @@ RESET_HANDLER
       STD   BRKV
       ;; Initialize the UART
       ;; RX INT ENABLED, RTS LOW, TX INT DISABLED, 8N1, CLK/16
-   IF FLOW_CONTROL == FC_RTS_CTS
-      JSR  UPDATE_UART_CTRL
-   ELSE
-      LDA  #$95
-      STA  UART
-   ENDIF
+      UART_INIT
       ;; Enable interrupts
       CLI
       ;; Print the reset message
