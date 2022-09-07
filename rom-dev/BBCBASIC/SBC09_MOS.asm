@@ -42,6 +42,18 @@ TX_BUFFER    EQU  $7F80
 
 UART         EQU  $A000
 
+
+SYSCLK_UPDATE MACRO
+      INC  <ZP_TIME
+      BNE  1F
+      INC  <ZP_TIME+1
+      BNE  1F
+      INC  <ZP_TIME+2
+      BNE  1F
+      INC  <ZP_TIME+3
+1
+      ENDM
+
    IF UART_TYPE == UART_6850
 
 UART_CTRL    EQU  UART
@@ -79,6 +91,7 @@ UART_CRA     EQU UART+0x2
 UART_THRA    EQU UART+0x3
 UART_RHRA    EQU UART+0x3
 UART_ACR     EQU UART+0x4
+UART_ISR     EQU UART+0x5
 UART_IMR     EQU UART+0x5
 UART_CTU     EQU UART+0x6
 UART_CTL     EQU UART+0x7
@@ -103,12 +116,12 @@ UART_RXINT   EQU  $01
 UART_TXINT   EQU  $04
 
 UART_ENABLE_TXINT MACRO
-      LDB  #$03
+      LDB  #$0B
       STB  UART_IMR
       ENDM
 
 UART_DISABLE_TXINT MACRO
-      LDA  #$02
+      LDA  #$0A
       STA  UART_IMR
       ENDM
 
@@ -122,11 +135,18 @@ UART_INIT MACRO
       STA  UART_CRA
       LDA  #%11101110    ; External 16x -> 115200 baud
       STA  UART_CSRA
+      LDA  #%01110000    ; Timer Mode, Clock = XTAL/16 = 3686400 / 16 = 230400 Hz
+      STA  UART_ACR
+      LDD  #(2304/2-1)   ; 16-bit write to counter to get a 100Hz tick
+      STD  UART_CTU
    IF FLOW_CONTROL == FC_RTS_CTS
       JSR  UPDATE_UART_CTRL
    ELSE
       UART_DISABLE_TXINT
    ENDIF
+      LDA  UART_STARTCT  ; Start the counter-timer
+      LDA  #%00000100
+      STA  UART_OPCR     ; Ouput timer squarewave on OP3
       ENDM
 
    ENDIF
@@ -169,9 +189,9 @@ UPDATE_UART_CTRL
 ;;     UART_OPRSET = 1    ; assert RTS
 ;;
 ;; if Tx occupancy > 0% then
-;;     UART_IMR = $01
+;;     UART_IMR = $0B
 ;; else
-;;     UART_IMR = $00
+;;     UART_IMR = $0A
 ;;
 
 UPDATE_UART_CTRL
@@ -187,18 +207,26 @@ UPDATE_UART_CTRL
       LDB  <ZP_TX_HEAD    ; Is the Tx buffer empty?
       CMPB <ZP_TX_TAIL
       BEQ  1F
-      LDB  #$03           ; Not-empty, so enable TxInt (leaving RxInt enabled)
+      LDB  #$0B           ; Not-empty, so enable TxInt (leaving Rx and Timer ints enabled)
       BRA  2F
-1     LDB  #$02           ; Empty, so disable TxInt (leaving RxInt enabled)
+1     LDB  #$0A           ; Empty, so disable TxInt (leaving Rx and Timer ints enabled)
 2     STB  UART_IMR
       RTS
    ENDIF
 
    ENDIF
 
-
-
 IRQ_HANDLER
+
+   IF UART_TYPE == UART_68681
+      LDA  UART_ISR        ; Read UART Interrupt Status Register
+      ANDA #$08            ; Check the timer bit
+      BEQ  1F
+      LDA  UART_STOPCT     ; Clear the interrupt
+      SYSCLK_UPDATE        ; Update the system clock
+1
+   ENDIF
+
       LDA  UART_STATUS     ; Read UART status register
       BITA #UART_RXINT     ; Test bit 0 (RxFull)
 
@@ -252,7 +280,7 @@ IRQ_EXIT
 
    IF FLOW_CONTROL == FC_RTS_CTS
 IRQ_TX_EMPTY
-      BSR UPDATE_UART_CTRL
+      JSR UPDATE_UART_CTRL
    ELSE
       RTI
 IRQ_TX_EMPTY
@@ -275,7 +303,7 @@ OSRDCH
       LDA   B,X
       INC   <ZP_RX_HEAD
    IF FLOW_CONTROL == FC_RTS_CTS
-      BSR   UPDATE_UART_CTRL
+      JSR   UPDATE_UART_CTRL
    ENDIF
       LDB   <ZP_ESCFLAG
       ROLB
@@ -376,15 +404,12 @@ OSWORD_READSYSCLK
       STA  ,X+
       LDA  <ZP_TIME+3
       STA  ,X+
-      ;; Increment the clock each time it's read, as we have no other timer!
-      INC  <ZP_TIME
-      BNE  1F
-      INC  <ZP_TIME+1
-      BNE  1F
-      INC  <ZP_TIME+2
-      BNE  1F
-      INC  <ZP_TIME+3
-1     RTS
+
+      ;; The 6850 has no timer interrupt, so fake it!
+   IF UART_TYPE == UART_6850
+      SYSCLK_UPDATE
+   ENDIF
+      RTS
 
 OSWORD_WRITESYSCLK
       LDA  ,X+
